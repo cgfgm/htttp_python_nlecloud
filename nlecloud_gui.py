@@ -85,6 +85,14 @@ class NLECloudClient:
     def get_realtime(self, device_id):
         return self.request_json("GET", f"{self.base_url}/Devices/Datas", params={"devIds": device_id})
 
+    def send_command(self, device_id, api_tag, value):
+        return self.request_json(
+            "POST",
+            f"{self.base_url}/Cmds",
+            params={"deviceId": device_id, "apiTag": api_tag},
+            json=value,
+        )
+
 
 class RealtimeChart(tk.Canvas):
     """使用 tkinter Canvas 绘制实时折线图，避免额外图表依赖。"""
@@ -176,6 +184,13 @@ class NLECloudApp(tk.Tk):
         self.device_id_var = tk.StringVar()
         self.status_var = tk.StringVar(value="未登录")
         self.poll_interval_var = tk.IntVar(value=POLL_INTERVAL_SECONDS)
+        self.temperature_var = tk.DoubleVar(value=25.0)
+        self.temperature_label_var = tk.StringVar(value="25.0 ℃")
+        self.temperature_threshold_var = tk.DoubleVar(value=30.0)
+        self.actuator_tag_var = tk.StringVar()
+        self.control_status_var = tk.StringVar(value="温控联动未触发")
+        self.last_auto_command_state = None
+        self.pending_temperature_job = None
 
         self._build_ui()
         self._load_saved_token()
@@ -186,7 +201,7 @@ class NLECloudApp(tk.Tk):
         root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(2, weight=1)
+        root.rowconfigure(3, weight=1)
 
         login_frame = ttk.LabelFrame(root, text="登录", padding=10)
         login_frame.grid(row=0, column=0, sticky="ew")
@@ -214,8 +229,39 @@ class NLECloudApp(tk.Tk):
         self.monitor_button.grid(row=0, column=4, padx=(0, 8))
         ttk.Button(monitor_frame, text="清空图表", command=self.clear_chart).grid(row=0, column=5, padx=(0, 8))
 
+        control_frame = ttk.LabelFrame(root, text="温度联动控制", padding=10)
+        control_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        control_frame.columnconfigure(1, weight=1)
+        ttk.Label(control_frame, text="温度").grid(row=0, column=0, padx=(0, 6))
+        temperature_scale = ttk.Scale(
+            control_frame,
+            from_=-20,
+            to=80,
+            orient="horizontal",
+            variable=self.temperature_var,
+            command=self._on_temperature_change,
+        )
+        temperature_scale.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(control_frame, textvariable=self.temperature_label_var, width=9).grid(row=0, column=2, padx=(0, 12))
+        ttk.Label(control_frame, text="阈值(℃)").grid(row=0, column=3, padx=(0, 6))
+        ttk.Spinbox(
+            control_frame,
+            from_=-20,
+            to=80,
+            increment=0.5,
+            textvariable=self.temperature_threshold_var,
+            width=8,
+            command=self._on_threshold_change,
+        ).grid(row=0, column=4, padx=(0, 12))
+        ttk.Label(control_frame, text="传感器标识名").grid(row=0, column=5, padx=(0, 6))
+        ttk.Entry(control_frame, textvariable=self.actuator_tag_var, width=20).grid(row=0, column=6, padx=(0, 8))
+        ttk.Button(control_frame, text="手动打开", command=lambda: self.send_manual_command(1)).grid(row=0, column=7, padx=(0, 6))
+        ttk.Button(control_frame, text="手动关闭", command=lambda: self.send_manual_command(0)).grid(row=0, column=8, padx=(0, 12))
+        ttk.Label(control_frame, textvariable=self.control_status_var, foreground="#57606a").grid(row=0, column=9, sticky="e")
+        self.temperature_threshold_var.trace_add("write", lambda *_: self._on_threshold_change())
+
         content = ttk.PanedWindow(root, orient="vertical")
-        content.grid(row=2, column=0, sticky="nsew")
+        content.grid(row=3, column=0, sticky="nsew")
 
         table_frame = ttk.LabelFrame(content, text="实时数据", padding=8)
         table_frame.rowconfigure(0, weight=1)
@@ -307,6 +353,74 @@ class NLECloudApp(tk.Tk):
         if self.client.access_token:
             self.status_var.set("监控已停止")
 
+    def _build_command_context(self):
+        if not self.client.access_token:
+            return None, None, "请先登录或读取已保存 Token。"
+        device_id = self.device_id_var.get().strip()
+        if not device_id:
+            return None, None, "请输入设备ID。"
+        api_tag = self.actuator_tag_var.get().strip()
+        if not api_tag:
+            return None, None, "请输入要控制的传感器标识名。"
+        return device_id, api_tag, None
+
+    def _send_command_async(self, value, source):
+        device_id, api_tag, error = self._build_command_context()
+        if error:
+            self.control_status_var.set(error)
+            if source == "手动":
+                messagebox.showwarning("控制", error)
+            return False
+        state_text = "打开" if value == 1 else "关闭"
+        self.control_status_var.set(f"正在{state_text} {api_tag} ...")
+        threading.Thread(
+            target=self._command_worker,
+            args=(device_id, api_tag, value, source),
+            daemon=True,
+        ).start()
+        return True
+
+    def _command_worker(self, device_id, api_tag, value, source):
+        try:
+            data = self.client.send_command(device_id, api_tag, value)
+            self.message_queue.put(("command_result", (data, api_tag, value, source)))
+        except (urllib.error.URLError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            self.message_queue.put(("error", f"发送控制命令失败：{exc}"))
+
+    def send_manual_command(self, value):
+        if self._send_command_async(value, "手动"):
+            self.last_auto_command_state = value
+
+    def _on_temperature_change(self, value=None):
+        try:
+            temperature = float(value if value is not None else self.temperature_var.get())
+        except (TypeError, ValueError):
+            return
+        self.temperature_label_var.set(f"{temperature:.1f} ℃")
+        if self.pending_temperature_job is not None:
+            self.after_cancel(self.pending_temperature_job)
+        self.pending_temperature_job = self.after(300, self._evaluate_temperature_rule)
+
+    def _on_threshold_change(self):
+        self.last_auto_command_state = None
+        if self.pending_temperature_job is not None:
+            self.after_cancel(self.pending_temperature_job)
+        self.pending_temperature_job = self.after(300, self._evaluate_temperature_rule)
+
+    def _evaluate_temperature_rule(self):
+        self.pending_temperature_job = None
+        try:
+            temperature = float(self.temperature_var.get())
+            threshold = float(self.temperature_threshold_var.get())
+        except (TypeError, ValueError, tk.TclError):
+            self.control_status_var.set("温度或阈值不是有效数字。")
+            return
+        next_state = 1 if temperature > threshold else 0
+        if next_state == self.last_auto_command_state:
+            return
+        if self._send_command_async(next_state, "自动温控"):
+            self.last_auto_command_state = next_state
+
     def _monitor_worker(self, device_id, interval):
         while not self.stop_event.is_set():
             try:
@@ -333,10 +447,19 @@ class NLECloudApp(tk.Tk):
                 self._apply_realtime(payload)
             elif event == "monitor_stopped":
                 self.monitor_button.configure(text="开始监控")
+            elif event == "command_result":
+                self._apply_command_result(*payload)
             elif event == "error":
                 self.status_var.set(payload)
                 messagebox.showerror("错误", payload)
         self.after(150, self._process_queue)
+
+    def _apply_command_result(self, data, api_tag, value, source):
+        if data.get("Status") not in (0, None):
+            self.control_status_var.set("命令返回错误：" + str(data.get("Msg", "未知错误")))
+            return
+        state_text = "打开" if value == 1 else "关闭"
+        self.control_status_var.set(f"{source}已{state_text} {api_tag}")
 
     def _apply_realtime(self, data):
         if data.get("Status") not in (0, None):
@@ -383,6 +506,9 @@ class NLECloudApp(tk.Tk):
         self.status_var.set("图表和实时数据已清空")
 
     def _on_close(self):
+        if self.pending_temperature_job is not None:
+            self.after_cancel(self.pending_temperature_job)
+            self.pending_temperature_job = None
         self.stop_event.set()
         self.destroy()
 
