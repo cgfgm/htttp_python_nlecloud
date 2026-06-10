@@ -178,6 +178,7 @@ class NLECloudApp(tk.Tk):
         self.client = NLECloudClient()
         self.message_queue = queue.Queue()
         self.stop_event = threading.Event()
+        self.command_lock = threading.Lock()
         self.monitor_thread = None
         self.series = {}
         self.latest_rows = {}
@@ -189,6 +190,11 @@ class NLECloudApp(tk.Tk):
         self.device_id_var = tk.StringVar()
         self.status_var = tk.StringVar(value="未登录")
         self.poll_interval_var = tk.IntVar(value=POLL_INTERVAL_SECONDS)
+        self.temperature_threshold_var = tk.DoubleVar(value=DEFAULT_TEMPERATURE_THRESHOLD)
+        self.temperature_threshold_label_var = tk.StringVar(value=self._format_temperature_threshold())
+        self.actuator_tag_var = tk.StringVar()
+        self.auto_control_var = tk.BooleanVar(value=True)
+        self.control_status_var = tk.StringVar(value="执行器控制待命")
 
         self._build_ui()
         self._load_saved_token()
@@ -561,6 +567,7 @@ class NLECloudApp(tk.Tk):
             return
         devices = data.get("ResultObj", [])
         row_count = 0
+        temperature_value = self._extract_temperature_value(devices)
         for device in devices:
             device_name = device.get("Name") or str(device.get("DeviceID", "未知设备"))
             for item in device.get("Datas", []):
@@ -578,6 +585,7 @@ class NLECloudApp(tk.Tk):
                 self._sync_temperature_controls_from_realtime(tag, value)
                 row_count += 1
         self.chart.set_series(self.series)
+        self._run_auto_temperature_control(temperature_value)
         self.status_var.set(f"最新刷新：{time.strftime('%Y-%m-%d %H:%M:%S')}，更新 {row_count} 条数据")
 
     def _sync_temperature_controls_from_realtime(self, tag, value):
