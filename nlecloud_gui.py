@@ -16,6 +16,8 @@ BASE_URL = "http://api.nlecloud.com"
 TOKEN_FILE = "token.json"
 POLL_INTERVAL_SECONDS = 3
 MAX_POINTS_PER_TAG = 60
+DEFAULT_TEMPERATURE_THRESHOLD = 30.0
+TEMPERATURE_TAG_KEYWORDS = ("temp", "temperature", "temper", "温度", "wendu")
 
 
 class NLECloudClient:
@@ -84,6 +86,14 @@ class NLECloudClient:
 
     def get_realtime(self, device_id):
         return self.request_json("GET", f"{self.base_url}/Devices/Datas", params={"devIds": device_id})
+
+    def send_command(self, device_id, api_tag, value):
+        return self.request_json(
+            "POST",
+            f"{self.base_url}/Cmds",
+            params={"deviceId": device_id, "apiTag": api_tag},
+            json=value,
+        )
 
 
 class RealtimeChart(tk.Canvas):
@@ -161,21 +171,28 @@ class NLECloudApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("NLECloud 图形化监控")
-        self.geometry("980x680")
-        self.minsize(820, 560)
+        self.geometry("1080x760")
+        self.minsize(920, 640)
 
         self.client = NLECloudClient()
         self.message_queue = queue.Queue()
         self.stop_event = threading.Event()
+        self.command_lock = threading.Lock()
         self.monitor_thread = None
         self.series = {}
         self.latest_rows = {}
+        self.last_auto_command = None
 
         self.username_var = tk.StringVar()
         self.password_var = tk.StringVar()
         self.device_id_var = tk.StringVar()
         self.status_var = tk.StringVar(value="未登录")
         self.poll_interval_var = tk.IntVar(value=POLL_INTERVAL_SECONDS)
+        self.temperature_threshold_var = tk.DoubleVar(value=DEFAULT_TEMPERATURE_THRESHOLD)
+        self.temperature_threshold_label_var = tk.StringVar(value=self._format_temperature_threshold())
+        self.actuator_tag_var = tk.StringVar()
+        self.auto_control_var = tk.BooleanVar(value=True)
+        self.control_status_var = tk.StringVar(value="执行器控制待命")
 
         self._build_ui()
         self._load_saved_token()
@@ -186,7 +203,7 @@ class NLECloudApp(tk.Tk):
         root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(2, weight=1)
+        root.rowconfigure(3, weight=1)
 
         login_frame = ttk.LabelFrame(root, text="登录", padding=10)
         login_frame.grid(row=0, column=0, sticky="ew")
@@ -205,7 +222,7 @@ class NLECloudApp(tk.Tk):
 
         monitor_frame = ttk.LabelFrame(root, text="监控", padding=10)
         monitor_frame.grid(row=1, column=0, sticky="ew", pady=(10, 10))
-        monitor_frame.columnconfigure(8, weight=1)
+        monitor_frame.columnconfigure(6, weight=1)
         ttk.Label(monitor_frame, text="设备ID").grid(row=0, column=0, padx=(0, 6))
         ttk.Entry(monitor_frame, textvariable=self.device_id_var, width=24).grid(row=0, column=1, padx=(0, 12))
         ttk.Label(monitor_frame, text="刷新间隔(秒)").grid(row=0, column=2, padx=(0, 6))
@@ -214,8 +231,37 @@ class NLECloudApp(tk.Tk):
         self.monitor_button.grid(row=0, column=4, padx=(0, 8))
         ttk.Button(monitor_frame, text="清空图表", command=self.clear_chart).grid(row=0, column=5, padx=(0, 8))
 
+        control_frame = ttk.LabelFrame(root, text="温度自动/手动控制", padding=10)
+        control_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        control_frame.columnconfigure(10, weight=1)
+        ttk.Label(control_frame, text="温度阈值(℃)").grid(row=0, column=0, padx=(0, 6))
+        temperature_slider = ttk.Scale(
+            control_frame,
+            from_=0,
+            to=100,
+            variable=self.temperature_threshold_var,
+            command=self._on_temperature_threshold_changed,
+            length=220,
+        )
+        temperature_slider.grid(row=0, column=1, padx=(0, 8), sticky="ew")
+        ttk.Label(control_frame, textvariable=self.temperature_threshold_label_var, width=8).grid(row=0, column=2, padx=(0, 16))
+        ttk.Label(control_frame, text="传感器标识名").grid(row=0, column=3, padx=(0, 6))
+        ttk.Entry(control_frame, textvariable=self.actuator_tag_var, width=20).grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(control_frame, text="手动打开", command=lambda: self.manual_control(True)).grid(row=0, column=5, padx=(0, 6))
+        ttk.Button(control_frame, text="手动关闭", command=lambda: self.manual_control(False)).grid(row=0, column=6, padx=(0, 12))
+        ttk.Checkbutton(control_frame, text="启用自动控制", variable=self.auto_control_var).grid(row=0, column=7, padx=(0, 12))
+        ttk.Label(control_frame, textvariable=self.control_status_var, foreground="#0969da").grid(
+            row=0, column=10, sticky="e"
+        )
+
+        ttk.Label(
+            control_frame,
+            text="自动规则：实时温度 > 阈值时打开该标识名，否则关闭；温度从 ApiTag/名称含 temp、temperature、温度、wendu 的数值数据中读取。",
+            foreground="#57606a",
+        ).grid(row=1, column=0, columnspan=11, sticky="w", pady=(8, 0))
+
         content = ttk.PanedWindow(root, orient="vertical")
-        content.grid(row=2, column=0, sticky="nsew")
+        content.grid(row=3, column=0, sticky="nsew")
 
         table_frame = ttk.LabelFrame(content, text="实时数据", padding=8)
         table_frame.rowconfigure(0, weight=1)
@@ -333,6 +379,11 @@ class NLECloudApp(tk.Tk):
                 self._apply_realtime(payload)
             elif event == "monitor_stopped":
                 self.monitor_button.configure(text="开始监控")
+            elif event == "command_ok":
+                self.control_status_var.set(payload)
+            elif event == "command_error":
+                self.last_auto_command = None
+                self.control_status_var.set(payload)
             elif event == "error":
                 self.status_var.set(payload)
                 messagebox.showerror("错误", payload)
@@ -344,6 +395,7 @@ class NLECloudApp(tk.Tk):
             return
         devices = data.get("ResultObj", [])
         row_count = 0
+        temperature_value = self._extract_temperature_value(devices)
         for device in devices:
             device_name = device.get("Name") or str(device.get("DeviceID", "未知设备"))
             for item in device.get("Datas", []):
@@ -360,7 +412,91 @@ class NLECloudApp(tk.Tk):
                 self._append_chart_point(tag, value, record_time)
                 row_count += 1
         self.chart.set_series(self.series)
+        self._run_auto_temperature_control(temperature_value)
         self.status_var.set(f"最新刷新：{time.strftime('%Y-%m-%d %H:%M:%S')}，更新 {row_count} 条数据")
+
+    def _extract_temperature_value(self, devices):
+        for device in devices:
+            for item in device.get("Datas", []):
+                tag = str(item.get("ApiTag", ""))
+                name = str(item.get("Name", ""))
+                searchable = f"{tag} {name}".lower()
+                if any(keyword in searchable for keyword in TEMPERATURE_TAG_KEYWORDS):
+                    try:
+                        return float(item.get("Value", ""))
+                    except (TypeError, ValueError):
+                        continue
+        return None
+
+    def _run_auto_temperature_control(self, temperature_value):
+        if not self.auto_control_var.get():
+            return
+        if temperature_value is None:
+            self.control_status_var.set("未找到温度数据，自动控制未执行")
+            return
+        threshold = float(self.temperature_threshold_var.get())
+        should_open = temperature_value > threshold
+        if should_open == self.last_auto_command:
+            self.control_status_var.set(
+                f"自动控制保持{'打开' if should_open else '关闭'}：温度 {temperature_value:.1f}℃，阈值 {threshold:.1f}℃"
+            )
+            return
+        reason = f"自动控制：温度 {temperature_value:.1f}℃ {'>' if should_open else '<='} 阈值 {threshold:.1f}℃"
+        self._send_actuator_command(should_open, reason=reason, show_validation_popup=False)
+
+    def _format_temperature_threshold(self):
+        return f"{float(self.temperature_threshold_var.get()):.1f}℃"
+
+    def _on_temperature_threshold_changed(self, _value=None):
+        self.temperature_threshold_label_var.set(self._format_temperature_threshold())
+        self.last_auto_command = None
+
+    def manual_control(self, open_state):
+        self._send_actuator_command(open_state, reason="手动控制", show_validation_popup=True)
+
+    def _send_actuator_command(self, open_state, reason, show_validation_popup):
+        if not self.client.access_token:
+            self.control_status_var.set("自动控制未执行：请先登录或读取已保存 Token")
+            if show_validation_popup:
+                messagebox.showwarning("执行器控制", "请先登录或读取已保存 Token。")
+            return False
+        device_id = self.device_id_var.get().strip()
+        if not device_id:
+            self.control_status_var.set("自动控制未执行：请输入设备ID")
+            if show_validation_popup:
+                messagebox.showwarning("执行器控制", "请输入设备ID。")
+            return False
+        api_tag = self.actuator_tag_var.get().strip()
+        if not api_tag:
+            self.control_status_var.set("自动控制未执行：请输入要控制的传感器标识名")
+            if show_validation_popup:
+                messagebox.showwarning("执行器控制", "请输入要控制的传感器标识名。")
+            return False
+
+        command_value = 1 if open_state else 0
+        state_text = "打开" if open_state else "关闭"
+        self.control_status_var.set(f"正在{state_text} {api_tag} ...")
+        if reason.startswith("自动控制"):
+            self.last_auto_command = open_state
+        else:
+            self.last_auto_command = None
+        threading.Thread(
+            target=self._command_worker,
+            args=(device_id, api_tag, command_value, reason),
+            daemon=True,
+        ).start()
+        return True
+
+    def _command_worker(self, device_id, api_tag, command_value, reason):
+        with self.command_lock:
+            try:
+                data = self.client.send_command(device_id, api_tag, command_value)
+                if data.get("Status") not in (0, None):
+                    raise RuntimeError(str(data.get("Msg", "未知错误")))
+                state_text = "打开" if command_value == 1 else "关闭"
+                self.message_queue.put(("command_ok", f"{reason}，{api_tag} 已{state_text}"))
+            except (urllib.error.URLError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                self.message_queue.put(("command_error", f"命令发送失败：{exc}"))
 
     def _append_chart_point(self, tag, value, record_time):
         if not tag:
