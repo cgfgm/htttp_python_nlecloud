@@ -19,6 +19,11 @@ MAX_POINTS_PER_TAG = 60
 DEFAULT_TEMPERATURE_THRESHOLD = 30.0
 COMMAND_ON_VALUE = 1
 COMMAND_OFF_VALUE = 0
+RAW_LOG_FILE = "nlecloud_raw.log"
+
+
+def is_success_status(status):
+    return status in (0, "0", None)
 
 
 class NLECloudClient:
@@ -32,6 +37,14 @@ class NLECloudClient:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        self.raw_logger = None
+
+    def set_raw_logger(self, raw_logger):
+        self.raw_logger = raw_logger
+
+    def _log_raw(self, direction, content):
+        if self.raw_logger:
+            self.raw_logger(direction, content)
 
     def request_json(self, method, url, **kwargs):
         params = kwargs.get("params")
@@ -46,8 +59,11 @@ class NLECloudClient:
             body = json.dumps(json_body).encode("utf-8")
 
         request = urllib.request.Request(url, data=body, method=method.upper(), headers=self.headers)
+        request_content = body.decode("utf-8") if body is not None else ""
+        self._log_raw("SEND", f"{method.upper()} {url}\n{request_content}")
         with urllib.request.urlopen(request, timeout=15) as response:
             payload = response.read().decode("utf-8")
+        self._log_raw("RECV", payload)
         return json.loads(payload)
 
     def load_token(self):
@@ -78,7 +94,7 @@ class NLECloudClient:
             f"{self.base_url}/Users/Login",
             json={"Account": username, "Password": password, "IsRememberMe": True},
         )
-        if data.get("Status") != 0:
+        if not is_success_status(data.get("Status")):
             raise RuntimeError("登录失败：" + str(data.get("Msg", "未知错误")))
         self.access_token = data["ResultObj"]["AccessToken"]
         self.headers.update({"AccessToken": self.access_token})
@@ -179,6 +195,7 @@ class NLECloudApp(tk.Tk):
         self.message_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.command_lock = threading.Lock()
+        self.log_lock = threading.Lock()
         self.monitor_thread = None
         self.series = {}
         self.latest_rows = {}
@@ -195,6 +212,7 @@ class NLECloudApp(tk.Tk):
         self.actuator_tag_var = tk.StringVar()
         self.auto_control_var = tk.BooleanVar(value=True)
         self.control_status_var = tk.StringVar(value="执行器控制待命")
+        self.log_enabled_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self._load_saved_token()
@@ -236,6 +254,12 @@ class NLECloudApp(tk.Tk):
         ttk.Button(login_frame, text="登录", command=self.login).grid(row=0, column=4, padx=(0, 8))
         ttk.Button(login_frame, text="读取已保存 Token", command=self.load_token_from_button).grid(row=0, column=5, padx=(0, 8))
         ttk.Button(login_frame, text="退出登录", command=self.logout).grid(row=0, column=6, padx=(0, 8))
+        ttk.Checkbutton(
+            login_frame,
+            text="记录收发日志",
+            variable=self.log_enabled_var,
+            command=self._on_logging_toggle,
+        ).grid(row=0, column=7, padx=(0, 8))
         ttk.Label(login_frame, textvariable=self.status_var, foreground="#0969da").grid(row=0, column=8, sticky="e")
 
         monitor_frame = ttk.LabelFrame(root, text="监控", padding=10)
@@ -406,6 +430,22 @@ class NLECloudApp(tk.Tk):
                 return control
         return None
 
+    def _on_logging_toggle(self):
+        if self.log_enabled_var.get():
+            self.client.set_raw_logger(self._write_raw_log)
+            self.status_var.set(f"收发日志已开启：{RAW_LOG_FILE}")
+        else:
+            self.client.set_raw_logger(None)
+            self.status_var.set("收发日志已关闭")
+
+    def _write_raw_log(self, direction, content):
+        with self.log_lock:
+            with open(RAW_LOG_FILE, "a", encoding="utf-8") as file_obj:
+                file_obj.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {direction}\n")
+                file_obj.write(content)
+                if not content.endswith("\n"):
+                    file_obj.write("\n")
+
     def _load_saved_token(self):
         try:
             if self.client.load_token():
@@ -506,7 +546,7 @@ class NLECloudApp(tk.Tk):
     def _command_worker(self, control_id, device_id, api_tag, value, action, source):
         try:
             data = self.client.send_command(device_id, api_tag, value)
-            if data.get("Status") not in (0, None):
+            if not is_success_status(data.get("Status")):
                 raise RuntimeError(str(data.get("Msg", "未知错误")))
             self.message_queue.put(("command_ok", (control_id, f"{source}{action} {api_tag} 成功")))
         except (urllib.error.URLError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
@@ -578,31 +618,83 @@ class NLECloudApp(tk.Tk):
         self.after(150, self._process_queue)
 
     def _apply_realtime(self, data):
-        if data.get("Status") not in (0, None):
+        if not is_success_status(data.get("Status")):
             self.status_var.set("接口返回错误：" + str(data.get("Msg", "未知错误")))
             return
-        devices = data.get("ResultObj", [])
-        row_count = 0
-        temperature_value = self._extract_temperature_value(devices)
-        for device in devices:
-            device_name = device.get("Name") or str(device.get("DeviceID", "未知设备"))
-            for item in device.get("Datas", []):
-                tag = str(item.get("ApiTag", ""))
-                value = item.get("Value", "")
-                record_time = item.get("RecordTime", "")
-                row_id = f"{device.get('DeviceID', device_name)}::{tag}"
-                values = (device_name, tag, value, record_time)
-                if row_id in self.latest_rows:
-                    self.tree.item(row_id, values=values)
-                else:
-                    self.tree.insert("", "end", iid=row_id, values=values)
-                    self.latest_rows[row_id] = True
-                self._append_chart_point(tag, value, record_time)
-                self._sync_temperature_controls_from_realtime(tag, value)
-                row_count += 1
+        rows = self._normalize_realtime_rows(data.get("ResultObj", []))
+        temperature_value = self._extract_temperature_value(rows)
+        for row_index, row in enumerate(rows):
+            device_name = row["device_name"]
+            tag = row["tag"]
+            value = row["value"]
+            record_time = row["record_time"]
+            row_id = f"{row['device_id']}::{tag or row_index}"
+            values = (device_name, tag, value, record_time)
+            if row_id in self.latest_rows:
+                self.tree.item(row_id, values=values)
+            else:
+                self.tree.insert("", "end", iid=row_id, values=values)
+                self.latest_rows[row_id] = True
+            self._append_chart_point(tag, value, record_time)
+            self._sync_temperature_controls_from_realtime(tag, value)
         self.chart.set_series(self.series)
         self._run_auto_temperature_control(temperature_value)
-        self.status_var.set(f"最新刷新：{time.strftime('%Y-%m-%d %H:%M:%S')}，更新 {row_count} 条数据")
+        self.status_var.set(f"最新刷新：{time.strftime('%Y-%m-%d %H:%M:%S')}，更新 {len(rows)} 条数据")
+
+    def _normalize_realtime_rows(self, result_obj):
+        if isinstance(result_obj, dict):
+            result_obj = [result_obj]
+        if not isinstance(result_obj, list):
+            return []
+
+        rows = []
+        for device in result_obj:
+            if not isinstance(device, dict):
+                continue
+            device_id = device.get("DeviceID") or device.get("ID") or self.device_id_var.get().strip() or "未知设备"
+            device_name = device.get("Name") or str(device_id)
+            datas = device.get("Datas")
+            if datas is None and "ApiTag" in device:
+                datas = [device]
+            if isinstance(datas, dict):
+                datas = [datas]
+            if not isinstance(datas, list):
+                continue
+            for item in datas:
+                if not isinstance(item, dict):
+                    continue
+                rows.append(
+                    {
+                        "device_id": device_id,
+                        "device_name": device_name,
+                        "tag": str(item.get("ApiTag", "")),
+                        "name": str(item.get("Name", "")),
+                        "value": item.get("Value", ""),
+                        "record_time": item.get("RecordTime", ""),
+                    }
+                )
+        return rows
+
+    def _extract_temperature_value(self, rows):
+        for row in rows:
+            tag_or_name = f"{row.get('tag', '')} {row.get('name', '')}".lower()
+            if "temp" not in tag_or_name and "温" not in tag_or_name:
+                continue
+            try:
+                return float(row.get("value"))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _run_auto_temperature_control(self, temperature_value):
+        if temperature_value is None:
+            return
+        for control in self.temperature_controls:
+            if control["source_tag_var"].get().strip():
+                continue
+            control["temperature_var"].set(temperature_value)
+            control["temperature_label_var"].set(f"{temperature_value:.1f} ℃")
+            self.evaluate_temperature_control(control)
 
     def _sync_temperature_controls_from_realtime(self, tag, value):
         if not tag:
